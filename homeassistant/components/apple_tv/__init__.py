@@ -44,6 +44,7 @@ from .const import (
 from .services import async_setup_services
 
 _LOGGER = logging.getLogger(__name__)
+_RECONNECT_LOGGER = _LOGGER.getChild("reconnect")
 
 CONFIG_SCHEMA = cv.config_entry_only_config_schema(DOMAIN)
 
@@ -81,6 +82,7 @@ type AppleTvConfigEntry = ConfigEntry[AppleTVManager]
 
 async def async_setup(hass: HomeAssistant, config: ConfigType) -> bool:
     """Set up the Apple TV component."""
+    _RECONNECT_LOGGER.debug("Apple TV reconnect diagnostics loaded")
     async_setup_services(hass)
     return True
 
@@ -161,6 +163,11 @@ class AppleTVManager(DeviceListener):
         _LOGGER.warning(
             'Connection lost to Apple TV "%s"', self.config_entry.data[CONF_NAME]
         )
+        _RECONNECT_LOGGER.debug(
+            "Apple TV entry %s: transport lost (%s)",
+            self.config_entry.entry_id,
+            type(exception).__name__,
+        )
         self._connection_was_lost = True
         self._handle_disconnect()
 
@@ -170,6 +177,9 @@ class AppleTVManager(DeviceListener):
 
         This is a callback function from pyatv.interface.DeviceListener.
         """
+        _RECONNECT_LOGGER.debug(
+            "Apple TV entry %s: transport closed", self.config_entry.entry_id
+        )
         self._handle_disconnect()
 
     def _handle_disconnect(self) -> None:
@@ -187,7 +197,10 @@ class AppleTVManager(DeviceListener):
 
     async def disconnect(self) -> None:
         """Disconnect from device."""
-        _LOGGER.debug("Disconnecting from device")
+        _RECONNECT_LOGGER.debug(
+            "Apple TV entry %s: disabling connection and cancelling any retry",
+            self.config_entry.entry_id,
+        )
         self.is_on = False
         try:
             if self.atv:
@@ -201,16 +214,23 @@ class AppleTVManager(DeviceListener):
 
     def _start_connect_loop(self) -> None:
         """Start background connect loop to device."""
-        if not self._task and self.atv is None and self.is_on:
+        retry_active = self.is_connecting
+        _RECONNECT_LOGGER.debug(
+            "Apple TV entry %s: retry requested (enabled=%s, connected=%s,"
+            " retry_active=%s, task_present=%s)",
+            self.config_entry.entry_id,
+            self.is_on,
+            self.atv is not None,
+            retry_active,
+            self._task is not None,
+        )
+        if not retry_active and self.atv is None and self.is_on:
             self._task = self.config_entry.async_create_background_task(
                 self.hass,
                 self._connect_loop(),
                 name=f"apple_tv connect loop {self.config_entry.title}",
-                eager_start=True,
-            )
-        else:
-            _LOGGER.debug(
-                "Not starting connect loop (%s, %s)", self.atv is None, self.is_on
+                # Publish the disconnect before a retry can publish a connection.
+                eager_start=False,
             )
 
     async def _connect_once(self, raise_missing_credentials: bool) -> None:
@@ -233,6 +253,10 @@ class AppleTVManager(DeviceListener):
         try:
             await self._connect_once(raise_missing_credentials)
         except exceptions.AuthenticationError:
+            _RECONNECT_LOGGER.debug(
+                "Apple TV entry %s: authentication failed",
+                self.config_entry.entry_id,
+            )
             self.config_entry.async_start_reauth(self.hass)
             await self.disconnect()
             _LOGGER.exception(
@@ -241,13 +265,23 @@ class AppleTVManager(DeviceListener):
             )
             return
         except asyncio.CancelledError:
-            pass
-        except Exception:
+            _RECONNECT_LOGGER.debug(
+                "Apple TV entry %s: attempt cancelled", self.config_entry.entry_id
+            )
+            raise
+        except Exception as err:
+            _RECONNECT_LOGGER.debug(
+                "Apple TV entry %s: attempt failed (%s)",
+                self.config_entry.entry_id,
+                type(err).__name__,
+            )
             _LOGGER.exception("Failed to connect")
 
     async def _connect_loop(self) -> None:
         """Connect loop background task function."""
-        _LOGGER.debug("Starting connect loop")
+        _RECONNECT_LOGGER.debug(
+            "Apple TV entry %s: retry loop started", self.config_entry.entry_id
+        )
 
         # Try to find device and connect as long as the user has said that
         # we are allowed to connect and we are not already connected.
@@ -265,10 +299,20 @@ class AppleTVManager(DeviceListener):
                 BACKOFF_TIME_UPPER_LIMIT,
             )
 
-            _LOGGER.debug("Reconnecting in %d seconds", backoff)
+            _RECONNECT_LOGGER.debug(
+                "Apple TV entry %s: attempt %d unsuccessful, retrying in %d seconds",
+                self.config_entry.entry_id,
+                self._connection_attempts,
+                backoff,
+            )
             await asyncio.sleep(backoff)
 
-        _LOGGER.debug("Connect loop ended")
+        _RECONNECT_LOGGER.debug(
+            "Apple TV entry %s: retry loop finished (enabled=%s, connected=%s)",
+            self.config_entry.entry_id,
+            self.is_on,
+            self.atv is not None,
+        )
         self._task = None
 
     async def _scan(self) -> AppleTV | None:
@@ -285,7 +329,9 @@ class AppleTVManager(DeviceListener):
             Protocol(int(protocol)) for protocol in config_entry.data[CONF_CREDENTIALS]
         }
 
-        _LOGGER.debug("Discovering device %s", config_entry.title)
+        _RECONNECT_LOGGER.debug(
+            "Apple TV entry %s: discovery started", config_entry.entry_id
+        )
         aiozc = await zeroconf.async_get_async_instance(hass)
         atvs = await scan(
             hass.loop,
@@ -295,12 +341,13 @@ class AppleTVManager(DeviceListener):
             aiozc=aiozc,
         )
         if atvs:
+            _RECONNECT_LOGGER.debug(
+                "Apple TV entry %s: discovery found a match", config_entry.entry_id
+            )
             return cast(AppleTV, atvs[0])
 
-        _LOGGER.debug(
-            "Failed to find device %s with address %s",
-            config_entry.title,
-            address,
+        _RECONNECT_LOGGER.debug(
+            "Apple TV entry %s: discovery found no match", config_entry.entry_id
         )
         # We no longer multicast scan for the device since as
         # soon as async_step_zeroconf runs, it will update the
@@ -328,14 +375,16 @@ class AppleTVManager(DeviceListener):
                     f"Protocol(s) {missing_protocols_str} not yet found for {name},"
                     " waiting for discovery."
                 )
-            _LOGGER.debug(
-                "Protocol(s) %s not yet found for %s, trying later",
+            _RECONNECT_LOGGER.debug(
+                "Apple TV entry %s: discovery missing paired protocols %s",
+                config_entry.entry_id,
                 missing_protocols_str,
-                name,
             )
             return
 
-        _LOGGER.debug("Connecting to device %s", self.config_entry.data[CONF_NAME])
+        _RECONNECT_LOGGER.debug(
+            "Apple TV entry %s: transport setup started", config_entry.entry_id
+        )
         session = async_get_clientsession(self.hass)
         self.atv = await connect(conf, self.hass.loop, session=session)
         self.atv.listener = self
@@ -345,6 +394,9 @@ class AppleTVManager(DeviceListener):
 
         self._async_setup_device_registry()
 
+        _RECONNECT_LOGGER.debug(
+            "Apple TV entry %s: transport connected", config_entry.entry_id
+        )
         self._connection_attempts = 0
         if self._connection_was_lost:
             _LOGGER.warning(
@@ -387,7 +439,7 @@ class AppleTVManager(DeviceListener):
     @property
     def is_connecting(self) -> bool:
         """Return true if connection is in progress."""
-        return self._task is not None
+        return self._task is not None and not self._task.done()
 
     def _address_updated(self, address: str) -> None:
         """Update cached address in config entry."""

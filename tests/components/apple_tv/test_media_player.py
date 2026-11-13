@@ -1,5 +1,6 @@
 """Tests for the Apple TV media player."""
 
+import asyncio
 from pathlib import Path
 from unittest.mock import AsyncMock, patch
 
@@ -26,13 +27,16 @@ from homeassistant.components.media_player import (
     MediaType,
 )
 from homeassistant.components.media_source import PlayMedia
-from homeassistant.const import ATTR_ENTITY_ID
+from homeassistant.const import ATTR_ENTITY_ID, STATE_ON
 from homeassistant.core import HomeAssistant
 from homeassistant.exceptions import HomeAssistantError
+
+from .common import create_conf, mrp_service
 
 from tests.typing import WebSocketGenerator
 
 ENTITY_ID = "media_player.living_room_living_room"
+REMOTE_ENTITY_ID = "remote.living_room_living_room"
 _MUSIC_URL = "http://example.local:8123/api/tts_proxy/abc.mp3"
 _VIDEO_URL = "http://example.local:8123/video.mp4"
 
@@ -289,3 +293,66 @@ async def test_browse_media_uses_media_source(
 
     assert response["success"]
     mock_browse.assert_called_once()
+
+
+async def test_reconnect_after_immediate_connection(
+    hass: HomeAssistant, mock_atv: AsyncMock
+) -> None:
+    """Immediate retries leave the remote connected after consecutive disconnects."""
+    scan_result = create_conf("127.0.0.1", "Living Room", mrp_service())
+
+    with (
+        patch("homeassistant.components.apple_tv.scan", return_value=[scan_result]),
+        patch(
+            "homeassistant.components.apple_tv.connect", return_value=mock_atv
+        ) as connect,
+    ):
+        mock_atv.listener.connection_closed()
+        await hass.async_block_till_done(wait_background_tasks=True)
+        connect.assert_awaited_once()
+
+        mock_atv.listener.connection_closed()
+        await hass.async_block_till_done(wait_background_tasks=True)
+        assert connect.await_count == 2
+
+    assert hass.states.get(REMOTE_ENTITY_ID).state == STATE_ON
+
+
+async def test_cancelled_retry_stops_when_replaced(
+    hass: HomeAssistant, mock_atv: AsyncMock
+) -> None:
+    """A cancelled connection attempt exits when the remote reconnects."""
+    manager = mock_atv.listener
+    scan_result = create_conf("127.0.0.1", "Living Room", mrp_service())
+    attempt_started = asyncio.Event()
+    never_ready = asyncio.Event()
+    connecting_task: asyncio.Task[object] | None = None
+
+    async def wait_for_connection(*args: object, **kwargs: object) -> AsyncMock:
+        nonlocal connecting_task
+        connecting_task = asyncio.current_task()
+        attempt_started.set()
+        await never_ready.wait()
+        return mock_atv
+
+    with (
+        patch("homeassistant.components.apple_tv.scan", return_value=[scan_result]),
+        patch(
+            "homeassistant.components.apple_tv.connect", side_effect=wait_for_connection
+        ) as connect,
+    ):
+        manager.connection_closed()
+        await attempt_started.wait()
+        original_task = connecting_task
+        assert original_task is not None
+        try:
+            await manager.disconnect()
+            await manager.connect()
+            await hass.async_block_till_done()
+
+            assert original_task.cancelled()
+            assert connect.await_count == 2
+        finally:
+            original_task.cancel()
+            await manager.disconnect()
+            await hass.async_block_till_done(wait_background_tasks=True)
